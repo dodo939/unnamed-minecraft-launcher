@@ -1,25 +1,43 @@
 package cmd
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/dodo939/unnamed-minecraft-launcher/util"
 )
 
-var os_name string                  // Operating system name ("windows" | "linux" | "osx")
-var version_id string               // Version ID
-var version_path string             // Path to version json file
-var versionData map[string]any      // Version json data
-var download_list []internetFile    // List of files need to download
-var nativeFiles []nativeFile        // List of native files need to copy
+var os_name string               // Operating system name ("windows" | "linux" | "osx")
+var version_id string            // Version ID
+var version_path string          // Path to version json file
+var versionData map[string]any   // Version json data
+var download_list []internetFile // List of files need to download
+var nativeFiles []nativeFile     // List of native files need to copy
+
+var loading_chars = []rune{'|', '/', '-', '\\'}
+var loading_index = 0
+
+// Variables for download
+var (
+    wg         sync.WaitGroup
+    semaphore  chan struct{}
+    totalFiles int
+    completed  int
+)
 
 type internetFile struct {
     Path        string
     FullPath    string
     URL         string
+    SHA1        string
 }
 
 type nativeFile struct {
@@ -42,6 +60,7 @@ func put_version_json() bool {
     var version_manifest map[string]any
 
     // Get version manifest
+    fmt.Println("Getting version manifest...")
     resp, err := http.Get("https://piston-meta.mojang.com/mc/game/version_manifest.json")
     if err != nil {
         fmt.Fprintln(os.Stderr, "Error:", err)
@@ -63,11 +82,12 @@ func put_version_json() bool {
     }
 
     if version_url == "" {
-        fmt.Println("Version not found for", version_id)
+        fmt.Fprintln(os.Stderr, "Version not found for", version_id)
         return false
     }
 
     // Get specific version json file
+    fmt.Println("Getting version json file...")
     versionResp, err := http.Get(version_url)
     if err != nil {
         fmt.Fprintln(os.Stderr, "Error:", err)
@@ -82,7 +102,7 @@ func put_version_json() bool {
         return false
     }
     defer version_json_file_fd.Close()
-    
+
     // Format and save version json file
     versionRespBody, _ := io.ReadAll(versionResp.Body)
     json.Unmarshal(versionRespBody, &versionData)
@@ -121,12 +141,14 @@ func collect_files() bool {
     assets = assets["objects"].(map[string]any)
 
     // Add assets files to download list
+    fmt.Println("Collecting asset files...")
     for _, obj := range assets {
         hash := obj.(map[string]any)["hash"].(string)
         download_list = append(download_list, internetFile{
             Path: ".minecraft/assets/objects/" + hash[:2],
             FullPath: ".minecraft/assets/objects/" + hash[:2] + "/" + hash,
             URL: "https://resources.download.minecraft.net/" + hash[:2] + "/" + hash,
+            SHA1: hash,
         })
     }
 
@@ -135,9 +157,11 @@ func collect_files() bool {
         Path: version_path,
         FullPath: version_path + "/" + version_id + ".jar",
         URL: versionData["downloads"].(map[string]any)["client"].(map[string]any)["url"].(string),
+        SHA1: versionData["downloads"].(map[string]any)["client"].(map[string]any)["sha1"].(string),
     })
 
     // Add libraries to download list
+    fmt.Println("Collecting library files...")
     for _, lib := range versionData["libraries"].([]any) {
         lib_data := lib.(map[string]any)
         if rules, ok := lib_data["rules"]; ok {
@@ -176,6 +200,7 @@ func collect_files() bool {
             Path: version_path + "/libraries/" + getDir(artifact["path"].(string)),
             FullPath: version_path + "/libraries/" + artifact["path"].(string),
             URL: artifact["url"].(string),
+            SHA1: artifact["sha1"].(string),
         })
 
         if natives, ok := lib_data["natives"].(map[string]any); ok {
@@ -201,6 +226,7 @@ func collect_files() bool {
                     Path: version_path + "/libraries/" + getDir(native_file["path"].(string)),
                     FullPath: version_path + "/libraries/" + native_file["path"].(string),
                     URL: native_file["url"].(string),
+                    SHA1: native_file["sha1"].(string),
                 })
             }
         }
@@ -212,14 +238,43 @@ func collect_files() bool {
         Path: version_path,
         FullPath: version_path + "/" + logging_file["id"].(string),
         URL: logging_file["url"].(string),
+        SHA1: logging_file["sha1"].(string),
     })
 
     return true
 }
 
-func download_files() bool {
-    // TODO: Download files
-    
+func download_all_files() bool {
+    fmt.Println("Download start")
+
+    totalFiles = len(download_list)
+    semaphore = make(chan struct{}, 8)  // Limit concurrency to 8
+    for _, file := range download_list {
+        wg.Add(1)
+        go download_single_file(file)
+    }
+
+    go show_progress()
+
+    wg.Wait()
+    fmt.Printf("\nDownload completed for all files!\n")
+
+    return true
+}
+
+func extract_native_files() bool {
+    fmt.Println("Extracting native files...")
+
+    output_dir := fmt.Sprintf(".minecraft/versions/%s/%s-natives", version_id, version_id)
+    os.MkdirAll(output_dir, 0755)
+
+    for _, file := range nativeFiles {
+        if err := extract_single_jar(file.FullPath, output_dir, file.Excludes); err != nil {
+            fmt.Fprintf(os.Stderr, "Failed to extract %s: %v\n", file.FullPath, err)
+            return false
+        }
+    }
+
     return true
 }
 
@@ -227,15 +282,18 @@ func download_files() bool {
 func Install(ver string) {
     // Get operating system
     switch runtime.GOOS {
-        case "windows":
-            os_name = "windows"
-        case "linux":
-            os_name = "linux"
-        case "darwin":
-            os_name = "osx"
-        default:
-            fmt.Fprintln(os.Stderr, "Unsupported operating system")
-            return
+    case "windows":
+        os_name = "windows"
+        fmt.Println("Your operating system is Windows")
+    case "linux":
+        os_name = "linux"
+        fmt.Println("Your operating system is Linux")
+    case "darwin":
+        os_name = "osx"
+        fmt.Println("Your operating system is MacOS")
+    default:
+        fmt.Fprintln(os.Stderr, "Unsupported operating system")
+        return
     }
     // Set version info
     version_id = ver
@@ -247,19 +305,134 @@ func Install(ver string) {
     if !collect_files() {
         return
     }
-    if !download_files() {
+    if !download_all_files() {
+        return
+    }
+    if !extract_native_files() {
         return
     }
 
-    // Show download_list and nativeFiles
-    if false {
-        fmt.Println("Download list:")
-        for _, file := range download_list {
-            fmt.Println(file.URL)
+    fmt.Printf("✨ Installation completed for %s! ✨\n", version_id)
+}
+
+func download_single_file(file internetFile) {
+    defer wg.Done()
+
+    semaphore <- struct{}{}
+    defer func() { <-semaphore }()
+
+    var err error
+    for range 3 {
+        err = download_and_save_file(file)
+        if err == nil {
+            break
         }
-        fmt.Println("Native files:")
-        for _, file := range nativeFiles {
-            fmt.Println(file.FullPath)
+        fmt.Printf("Error downloading %s: %v. Retrying...\n", file.URL, err)
+        time.Sleep(1 * time.Second)
+    }
+
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "Failed to download %s after 3 attempts: %v\n", file.URL, err)
+        return
+    }
+
+    completed++
+}
+
+func download_and_save_file(file internetFile) error {
+    if _, err := os.Stat(file.FullPath); err == nil {
+        sha1, err := util.CalculateSHA1FromPath(file.FullPath)
+        if err == nil && sha1 == file.SHA1 {
+            return nil // File already exists and has correct SHA1
         }
     }
+
+    resp, err := http.Get(file.URL)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return fmt.Errorf("bad status: %s", resp.Status)
+    }
+
+    os.MkdirAll(file.Path, 0755)
+    out, err := os.Create(file.FullPath)
+    if err != nil {
+        return err
+    }
+    defer out.Close()
+
+    _, err = io.Copy(out, resp.Body)
+    return err
+}
+
+func show_progress() {
+    ticker := time.NewTicker(200 * time.Millisecond)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        fmt.Printf("\rDownloading %d/%d files... %c", completed, totalFiles, loading_chars[loading_index])
+        loading_index = (loading_index + 1) % 4
+
+        if completed == totalFiles {
+            return
+        }
+    }
+}
+
+func extract_single_jar(fullpath, output_dir string, excludes []any) error {
+    r, err := zip.OpenReader(fullpath)
+    if err != nil {
+        return fmt.Errorf("failed to open jar file: %w", err)
+    }
+    defer r.Close()
+
+    for _, f := range r.File {
+        if should_exclude(f.Name, excludes) {
+            continue
+        }
+
+        target_path := output_dir + "/" + f.Name
+
+        if f.FileInfo().IsDir() {
+            os.MkdirAll(target_path, f.Mode())
+            continue
+        }
+
+        os.MkdirAll(getDir(target_path), 0755)
+
+        rc, err := f.Open()
+        if err != nil {
+            return fmt.Errorf("failed to open file %s in jar: %w", f.Name, err)
+        }
+
+        outFile, err := os.OpenFile(target_path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+        if err != nil {
+            rc.Close()
+            return fmt.Errorf("failed to create file %s: %w", target_path, err)
+        }
+
+        _, err = io.Copy(outFile, rc)
+        rc.Close()
+        outFile.Close()
+
+        if err != nil {
+            return fmt.Errorf("failed to write file %s: %w", target_path, err)
+        }
+    }
+
+    return nil
+}
+
+func should_exclude(path string, excludes []any) bool {
+    for _, exclude := range excludes {
+        exclude_path := exclude.(string)
+        if strings.HasPrefix(path, exclude_path) || path == exclude_path {
+            return true
+        }
+    }
+
+    return false
 }

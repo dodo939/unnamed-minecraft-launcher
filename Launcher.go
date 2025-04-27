@@ -12,6 +12,8 @@ func main() {
         return
     }
 
+    // TODO: Scan all game versions
+
     command := os.Args[1]
 
     switch command {

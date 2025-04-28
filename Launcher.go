@@ -23,6 +23,12 @@ func main() {
                 return
             }
             cmd.Install(os.Args[2])
+        case "run":
+            if len(os.Args) < 3 {
+                fmt.Println("Usage: umcl run <version>")
+                return
+            }
+            cmd.Run(os.Args[2])
         default:
             fmt.Println("Unknown command:", command)
     }
